@@ -110,13 +110,14 @@ func GitPatch(ctx context.Context, option patchOption) (io.Reader, []string, err
 }
 
 func gitDiff(ctx context.Context, extraArgs ...string) (*bytes.Buffer, error) {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--color=never", "--no-ext-diff")
+	// Not --relative, it hides rename sources outside the working directory; restrictToPrefix narrows the patch instead (quotePath=false keeps non-ASCII paths matchable).
+	cmd := exec.CommandContext(ctx, "git", "-c", "diff.relative=false", "-c", "core.quotePath=false",
+		"diff", "--color=never", "--no-ext-diff")
 
 	if isSupportedByGit(ctx, 2, 41, 0) {
 		cmd.Args = append(cmd.Args, "--default-prefix")
 	}
 
-	cmd.Args = append(cmd.Args, "--relative")
 	cmd.Args = append(cmd.Args, extraArgs...)
 
 	patch := new(bytes.Buffer)
@@ -129,7 +130,97 @@ func gitDiff(ctx context.Context, extraArgs ...string) (*bytes.Buffer, error) {
 		return nil, fmt.Errorf("error executing %q: %w: %w", strings.Join(cmd.Args, " "), err, readAsError(errBuff))
 	}
 
-	return patch, nil
+	prefix, err := getPrefix(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if prefix == "" {
+		return patch, nil
+	}
+
+	return restrictToPrefix(patch, prefix), nil
+}
+
+// restrictToPrefix narrows a repository-relative patch to the files under prefix, with paths relative to it.
+func restrictToPrefix(patch *bytes.Buffer, prefix string) *bytes.Buffer {
+	const (
+		diffHeader   = "diff --git "
+		newFileLabel = "+++ b/"
+		hunkHeader   = "@@ "
+	)
+
+	filtered := new(bytes.Buffer)
+
+	var (
+		section []byte
+		keep    bool
+		inHunks bool
+	)
+
+	flush := func() {
+		if keep {
+			filtered.Write(section)
+		}
+
+		section = section[:0]
+		keep = false
+		inHunks = false
+	}
+
+	for line := range bytes.Lines(patch.Bytes()) {
+		if bytes.HasPrefix(line, []byte(diffHeader)) {
+			flush()
+		}
+
+		switch {
+		case inHunks: // added lines like "++ x" look like file headers
+		case bytes.HasPrefix(line, []byte(hunkHeader)):
+			inHunks = true
+		case bytes.HasPrefix(line, []byte(newFileLabel)):
+			path := line[len(newFileLabel):]
+
+			if bytes.HasPrefix(path, []byte(prefix)) {
+				keep = true
+
+				line = append([]byte(newFileLabel), trimUnneededTab(path[len(prefix):])...)
+			}
+		}
+
+		section = append(section, line...)
+	}
+
+	flush()
+
+	return filtered
+}
+
+// trimUnneededTab drops the tab git appends to a header path containing a space, once the path no longer has one.
+func trimUnneededTab(path []byte) []byte {
+	body := bytes.TrimSuffix(path, []byte("\n"))
+	if !bytes.HasSuffix(body, []byte("\t")) || bytes.Contains(body, []byte(" ")) {
+		return path
+	}
+
+	return append(body[:len(body)-1:len(body)-1], '\n')
+}
+
+// getPrefix returns the working directory relative to the repository root,
+// with a trailing slash, or an empty string at the root.
+func getPrefix(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--show-prefix")
+
+	out := new(bytes.Buffer)
+	errBuff := new(bytes.Buffer)
+
+	cmd.Stdout = out
+	cmd.Stderr = errBuff
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error executing %q: %w: %w", strings.Join(cmd.Args, " "), err, readAsError(errBuff))
+	}
+
+	return strings.TrimSuffix(out.String(), "\n"), nil
 }
 
 func readAsError(buff io.Reader) error {
